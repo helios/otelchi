@@ -1,6 +1,8 @@
 package otelchi
 
 import (
+	"encoding/json"
+	"io"
 	"net/http"
 	"sync"
 
@@ -8,6 +10,7 @@ import (
 	"github.com/go-chi/chi/v5"
 
 	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/propagation"
 
 	otelcontrib "go.opentelemetry.io/contrib"
@@ -16,8 +19,31 @@ import (
 )
 
 const (
-	tracerName = "github.com/riandyrn/otelchi"
+	tracerName = "github.com/helios/otelchi"
 )
+
+type bodyWrapper struct {
+	io.ReadCloser
+
+	read        int64
+	err         error
+	requestBody []byte
+}
+
+func (w *bodyWrapper) Read(b []byte) (int, error) {
+	n, err := w.ReadCloser.Read(b)
+	if n > 0 {
+		w.requestBody = append(w.requestBody, b[0:n]...)
+	}
+	n1 := int64(n)
+	w.read += n1
+	w.err = err
+	return n, err
+}
+
+func (w *bodyWrapper) Close() error {
+	return w.ReadCloser.Close()
+}
 
 // Middleware sets up a handler to start tracing the incoming
 // requests. The serverName parameter should describe the name of the
@@ -61,9 +87,10 @@ type traceware struct {
 }
 
 type recordingResponseWriter struct {
-	writer  http.ResponseWriter
-	written bool
-	status  int
+	writer       http.ResponseWriter
+	written      bool
+	status       int
+	responseBody []byte
 }
 
 var rrwPool = &sync.Pool{
@@ -83,6 +110,11 @@ func getRRW(writer http.ResponseWriter) *recordingResponseWriter {
 					rrw.written = true
 					rrw.status = http.StatusOK
 				}
+
+				if len(b) > 0 {
+					rrw.responseBody = append(rrw.responseBody, b...)
+				}
+
 				return next(b)
 			}
 		},
@@ -102,6 +134,13 @@ func getRRW(writer http.ResponseWriter) *recordingResponseWriter {
 func putRRW(rrw *recordingResponseWriter) {
 	rrw.writer = nil
 	rrwPool.Put(rrw)
+}
+
+func collectRequestHeaders(r *http.Request, span oteltrace.Span) {
+	headersStr, err := json.Marshal(r.Header)
+	if err == nil {
+		span.SetAttributes(attribute.KeyValue{Key: "http.request.headers", Value: attribute.StringValue(string(headersStr))})
+	}
 }
 
 // ServeHTTP implements the http.Handler interface. It does the actual
@@ -132,6 +171,13 @@ func (tw traceware) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			spanName = addPrefixToSpanName(tw.reqMethodInSpanName, r.Method, routePattern)
 		}
 	}
+	
+	var bw bodyWrapper
+	if r.Body != nil && r.Body != http.NoBody {
+		bw.ReadCloser = r.Body
+		r.Body = &bw
+	}
+
 	ctx, span := tw.tracer.Start(
 		ctx, spanName,
 		oteltrace.WithAttributes(semconv.NetAttributesFromHTTPRequest("tcp", r)...),
@@ -140,6 +186,8 @@ func (tw traceware) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		oteltrace.WithSpanKind(oteltrace.SpanKindServer),
 	)
 	defer span.End()
+
+	collectRequestHeaders(r, span)
 
 	// get recording response writer
 	rrw := getRRW(w)
@@ -164,6 +212,13 @@ func (tw traceware) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// set span status
 	spanStatus, spanMessage := semconv.SpanStatusFromHTTPStatusCode(rrw.status)
 	span.SetStatus(spanStatus, spanMessage)
+
+	if len(bw.requestBody) > 0 {
+		span.SetAttributes(attribute.KeyValue{Key: "http.request.body", Value: attribute.StringValue(string(bw.requestBody))})
+	}
+	if len(rrw.responseBody) > 0 {
+		span.SetAttributes(attribute.KeyValue{Key: "http.response.body", Value: attribute.StringValue(string(rrw.responseBody))})
+	}
 }
 
 func addPrefixToSpanName(shouldAdd bool, prefix, spanName string) string {
