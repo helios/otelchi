@@ -103,6 +103,7 @@ func getRRW(writer http.ResponseWriter) *recordingResponseWriter {
 	rrw := rrwPool.Get().(*recordingResponseWriter)
 	rrw.written = false
 	rrw.status = 0
+	rrw.responseBody = []byte{}
 	rrw.writer = httpsnoop.Wrap(writer, httpsnoop.Hooks{
 		Write: func(next httpsnoop.WriteFunc) httpsnoop.WriteFunc {
 			return func(b []byte) (int, error) {
@@ -171,7 +172,7 @@ func (tw traceware) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			spanName = addPrefixToSpanName(tw.reqMethodInSpanName, r.Method, routePattern)
 		}
 	}
-	
+
 	var bw bodyWrapper
 	if r.Body != nil && r.Body != http.NoBody {
 		bw.ReadCloser = r.Body
