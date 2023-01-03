@@ -1,13 +1,17 @@
 package otelchi
 
 import (
+	"encoding/json"
+	"io"
 	"net/http"
+	"os"
 	"sync"
 
 	"github.com/felixge/httpsnoop"
 	"github.com/go-chi/chi/v5"
 
 	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/propagation"
 
 	otelcontrib "go.opentelemetry.io/contrib"
@@ -16,8 +20,34 @@ import (
 )
 
 const (
-	tracerName = "github.com/riandyrn/otelchi"
+	tracerName = "github.com/helios/otelchi"
 )
+
+type bodyWrapper struct {
+	io.ReadCloser
+
+	read         int64
+	err          error
+	requestBody  []byte
+	metadataOnly bool
+}
+
+func (w *bodyWrapper) Read(b []byte) (int, error) {
+	n, err := w.ReadCloser.Read(b)
+	if n > 0 {
+		if !w.metadataOnly {
+			w.requestBody = append(w.requestBody, b[0:n]...)
+		}
+	}
+	n1 := int64(n)
+	w.read += n1
+	w.err = err
+	return n, err
+}
+
+func (w *bodyWrapper) Close() error {
+	return w.ReadCloser.Close()
+}
 
 // Middleware sets up a handler to start tracing the incoming
 // requests. The serverName parameter should describe the name of the
@@ -45,6 +75,7 @@ func Middleware(serverName string, opts ...Option) func(next http.Handler) http.
 			handler:             handler,
 			chiRoutes:           cfg.ChiRoutes,
 			reqMethodInSpanName: cfg.RequestMethodInSpanName,
+			metadataOnly:        os.Getenv("HS_METADATA_ONLY") == "true",
 			filter:              cfg.Filter,
 		}
 	}
@@ -57,13 +88,16 @@ type traceware struct {
 	handler             http.Handler
 	chiRoutes           chi.Routes
 	reqMethodInSpanName bool
+	metadataOnly        bool
 	filter              func(r *http.Request) bool
 }
 
 type recordingResponseWriter struct {
-	writer  http.ResponseWriter
-	written bool
-	status  int
+	writer       http.ResponseWriter
+	written      bool
+	status       int
+	responseBody []byte
+	metadataOnly bool
 }
 
 var rrwPool = &sync.Pool{
@@ -76,6 +110,7 @@ func getRRW(writer http.ResponseWriter) *recordingResponseWriter {
 	rrw := rrwPool.Get().(*recordingResponseWriter)
 	rrw.written = false
 	rrw.status = 0
+	rrw.responseBody = []byte{}
 	rrw.writer = httpsnoop.Wrap(writer, httpsnoop.Hooks{
 		Write: func(next httpsnoop.WriteFunc) httpsnoop.WriteFunc {
 			return func(b []byte) (int, error) {
@@ -83,6 +118,11 @@ func getRRW(writer http.ResponseWriter) *recordingResponseWriter {
 					rrw.written = true
 					rrw.status = http.StatusOK
 				}
+
+				if !rrw.metadataOnly && len(b) > 0 {
+					rrw.responseBody = append(rrw.responseBody, b...)
+				}
+
 				return next(b)
 			}
 		},
@@ -104,6 +144,13 @@ func putRRW(rrw *recordingResponseWriter) {
 	rrwPool.Put(rrw)
 }
 
+func collectRequestHeaders(r *http.Request, span oteltrace.Span) {
+	headersStr, err := json.Marshal(r.Header)
+	if err == nil {
+		span.SetAttributes(attribute.KeyValue{Key: "http.request.headers", Value: attribute.StringValue(string(headersStr))})
+	}
+}
+
 // ServeHTTP implements the http.Handler interface. It does the actual
 // tracing of the request.
 func (tw traceware) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -112,6 +159,8 @@ func (tw traceware) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		tw.handler.ServeHTTP(w, r)
 		return
 	}
+
+	metadataOnly := tw.metadataOnly
 
 	// extract tracing header using propagator
 	ctx := tw.propagators.Extract(r.Context(), propagation.HeaderCarrier(r.Header))
@@ -132,6 +181,14 @@ func (tw traceware) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			spanName = addPrefixToSpanName(tw.reqMethodInSpanName, r.Method, routePattern)
 		}
 	}
+
+	var bw bodyWrapper
+	bw.metadataOnly = metadataOnly
+	if r.Body != nil && r.Body != http.NoBody {
+		bw.ReadCloser = r.Body
+		r.Body = &bw
+	}
+
 	ctx, span := tw.tracer.Start(
 		ctx, spanName,
 		oteltrace.WithAttributes(semconv.NetAttributesFromHTTPRequest("tcp", r)...),
@@ -143,6 +200,7 @@ func (tw traceware) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	// get recording response writer
 	rrw := getRRW(w)
+	rrw.metadataOnly = metadataOnly
 	defer putRRW(rrw)
 
 	// execute next http handler
@@ -164,6 +222,17 @@ func (tw traceware) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// set span status
 	spanStatus, spanMessage := semconv.SpanStatusFromHTTPStatusCode(rrw.status)
 	span.SetStatus(spanStatus, spanMessage)
+
+	if !metadataOnly {
+		collectRequestHeaders(r, span)
+		if len(bw.requestBody) > 0 {
+			span.SetAttributes(attribute.KeyValue{Key: "http.request.body", Value: attribute.StringValue(string(bw.requestBody))})
+		}
+
+		if len(rrw.responseBody) > 0 {
+			span.SetAttributes(attribute.KeyValue{Key: "http.response.body", Value: attribute.StringValue(string(rrw.responseBody))})
+		}
+	}
 }
 
 func addPrefixToSpanName(shouldAdd bool, prefix, spanName string) string {
