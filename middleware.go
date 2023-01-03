@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"io"
 	"net/http"
+	"os"
 	"sync"
 
 	"github.com/felixge/httpsnoop"
@@ -25,15 +26,18 @@ const (
 type bodyWrapper struct {
 	io.ReadCloser
 
-	read        int64
-	err         error
-	requestBody []byte
+	read         int64
+	err          error
+	requestBody  []byte
+	metadataOnly bool
 }
 
 func (w *bodyWrapper) Read(b []byte) (int, error) {
 	n, err := w.ReadCloser.Read(b)
 	if n > 0 {
-		w.requestBody = append(w.requestBody, b[0:n]...)
+		if !w.metadataOnly {
+			w.requestBody = append(w.requestBody, b[0:n]...)
+		}
 	}
 	n1 := int64(n)
 	w.read += n1
@@ -71,6 +75,7 @@ func Middleware(serverName string, opts ...Option) func(next http.Handler) http.
 			handler:             handler,
 			chiRoutes:           cfg.ChiRoutes,
 			reqMethodInSpanName: cfg.RequestMethodInSpanName,
+			metadataOnly:        os.Getenv("HS_METADATA_ONLY") == "true",
 			filter:              cfg.Filter,
 		}
 	}
@@ -83,6 +88,7 @@ type traceware struct {
 	handler             http.Handler
 	chiRoutes           chi.Routes
 	reqMethodInSpanName bool
+	metadataOnly        bool
 	filter              func(r *http.Request) bool
 }
 
@@ -91,6 +97,7 @@ type recordingResponseWriter struct {
 	written      bool
 	status       int
 	responseBody []byte
+	metadataOnly bool
 }
 
 var rrwPool = &sync.Pool{
@@ -112,7 +119,7 @@ func getRRW(writer http.ResponseWriter) *recordingResponseWriter {
 					rrw.status = http.StatusOK
 				}
 
-				if len(b) > 0 {
+				if !rrw.metadataOnly && len(b) > 0 {
 					rrw.responseBody = append(rrw.responseBody, b...)
 				}
 
@@ -153,6 +160,8 @@ func (tw traceware) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	metadataOnly := tw.metadataOnly
+
 	// extract tracing header using propagator
 	ctx := tw.propagators.Extract(r.Context(), propagation.HeaderCarrier(r.Header))
 	// create span, based on specification, we need to set already known attributes
@@ -174,6 +183,7 @@ func (tw traceware) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var bw bodyWrapper
+	bw.metadataOnly = metadataOnly
 	if r.Body != nil && r.Body != http.NoBody {
 		bw.ReadCloser = r.Body
 		r.Body = &bw
@@ -188,10 +198,9 @@ func (tw traceware) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	)
 	defer span.End()
 
-	collectRequestHeaders(r, span)
-
 	// get recording response writer
 	rrw := getRRW(w)
+	rrw.metadataOnly = metadataOnly
 	defer putRRW(rrw)
 
 	// execute next http handler
@@ -214,11 +223,15 @@ func (tw traceware) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	spanStatus, spanMessage := semconv.SpanStatusFromHTTPStatusCode(rrw.status)
 	span.SetStatus(spanStatus, spanMessage)
 
-	if len(bw.requestBody) > 0 {
-		span.SetAttributes(attribute.KeyValue{Key: "http.request.body", Value: attribute.StringValue(string(bw.requestBody))})
-	}
-	if len(rrw.responseBody) > 0 {
-		span.SetAttributes(attribute.KeyValue{Key: "http.response.body", Value: attribute.StringValue(string(rrw.responseBody))})
+	if !metadataOnly {
+		collectRequestHeaders(r, span)
+		if len(bw.requestBody) > 0 {
+			span.SetAttributes(attribute.KeyValue{Key: "http.request.body", Value: attribute.StringValue(string(bw.requestBody))})
+		}
+
+		if len(rrw.responseBody) > 0 {
+			span.SetAttributes(attribute.KeyValue{Key: "http.response.body", Value: attribute.StringValue(string(rrw.responseBody))})
+		}
 	}
 }
 
