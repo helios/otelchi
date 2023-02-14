@@ -204,6 +204,12 @@ func (tw traceware) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	rrw.metadataOnly = metadataOnly
 	defer putRRW(rrw)
 
+	// Add traceresponse header
+	if span.IsRecording() {
+		spanCtx := span.SpanContext()
+		rrw.writer.Header().Add("traceresponse", fmt.Sprintf("00-%s-%s-01", spanCtx.TraceID().String(), spanCtx.SpanID().String()))
+	}
+
 	// execute next http handler
 	r = r.WithContext(ctx)
 	tw.handler.ServeHTTP(rrw.writer, r)
@@ -215,12 +221,6 @@ func (tw traceware) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 		spanName = addPrefixToSpanName(tw.reqMethodInSpanName, r.Method, routePattern)
 		span.SetName(spanName)
-	}
-
-	// Add traceresponse header
-	if span.IsRecording() {
-		spanCtx := span.SpanContext()
-		rrw.writer.Header().Add("traceresponse", fmt.Sprintf("00-%s-%s-01", spanCtx.TraceID().String(), spanCtx.SpanID().String()))
 	}
 
 	// set status code attribute
