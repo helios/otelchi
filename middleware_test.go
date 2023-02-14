@@ -3,6 +3,7 @@ package otelchi
 import (
 	"bufio"
 	"context"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
@@ -239,6 +240,11 @@ func TestSDKIntegrationWithFilters(t *testing.T) {
 		attribute.String("http.target", "/book/foo"),
 		attribute.String("http.route", "/book/{title}"),
 	)
+
+	serverSpan := sr.Ended()[0]
+	traceresponse := w.Header().Get("traceresponse")
+	expectedTraceresponse := fmt.Sprintf("00-%s-%s-01", serverSpan.SpanContext().TraceID().String(), serverSpan.SpanContext().SpanID().String())
+	assert.Equal(t, traceresponse, expectedTraceresponse)
 }
 
 func TestSDKIntegrationWithChiRoutes(t *testing.T) {
