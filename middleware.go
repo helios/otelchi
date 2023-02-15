@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"os"
 	"sync"
@@ -54,6 +55,7 @@ func (w *bodyWrapper) Close() error {
 // requests. The serverName parameter should describe the name of the
 // (virtual) server handling the request.
 func Middleware(serverName string, opts ...Option) func(next http.Handler) http.Handler {
+	log.Println("applying helios/otelchi middleware")
 	cfg := config{}
 	for _, opt := range opts {
 		opt.apply(&cfg)
